@@ -37,8 +37,8 @@ JSON 清单并计算 SHA-256 摘要持久化，相同摘要幂等复用；
 `GET /design-archives/{id}/verify` 先校验归档记录自身（原始 manifest 可解析且
 为规范化 JSON、其 SHA-256 等于 digest 列、清单内 ID/数量与列值一致），再在
 同一快照语义下重新读取当前数据重算清单与摘要，报告是否一致、缺失的设计项与
-首个差异路径；归档自身损坏（含非法 JSON）或设计缺失、漂移均返回
-`consistent=false`，接口始终返回 200/404 而不会 500。
+首个差异路径；归档自身损坏（含非法 JSON）、设计缺失、审计行缺失（审计缺口）
+或内容漂移均返回 `consistent=false`，接口始终返回 200/404 而不会 500。
 
 ## 快速启动
 
@@ -164,7 +164,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/designs/{id}/wif` | WIF 1.1 导出：固定段落、1 基索引的 `text/plain` 文本（含 threading/tie_up/treadling/cyclic/max_float） |
 | `POST` | `/designs/import-wif` | WIF 1.1 导入：解析同格式 `[WIF]`/`[CONTENTS]`/`[WEAVING]` 等段落，校验后复用同一审计流程入库（201）；解析失败 400 且不写库 |
 | `POST` | `/design-archives` | 设计归档：1～50 个已入库 ID 按升序生成规范化 JSON 清单 + SHA-256 摘要并持久化；相同摘要幂等复用（200/201） |
-| `GET` | `/design-archives/{id}/verify` | 归档完整性校验：先校验归档自身（原始 manifest 合法且规范化、SHA-256 等于 digest、清单 ID/数量与列值一致），再重算当前摘要并报告一致性、缺失设计项与首个差异路径（归档损坏/非法 JSON 返回 200 + consistent=false，不触发 500） |
+| `GET` | `/design-archives/{id}/verify` | 归档完整性校验：先校验归档自身（原始 manifest 合法且规范化、SHA-256 等于 digest、清单 ID/数量与列值一致），再重算当前摘要并报告一致性、缺失设计项与首个差异路径（归档损坏/非法 JSON/审计缺口返回 200 + consistent=false，不触发 500） |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例：提交设计
@@ -1101,21 +1101,28 @@ JSON 等损坏都不会再被误报为「一致」。manifest 无法解析或列
 定位时 `first_diff_path` 为 `null`（连 `design_ids` 列都无法解析时
 `recomputed_digest` 也为 `null`、`missing_design_ids` 为 `[]`）。
 
+若归档后 **audits 行被删除而设计行仍在**（审计缺口），校验在同一读取快照中
+识别该缺口：返回 200、`consistent=false`、`recomputed_digest=null`（当前数据
+不足以重建完整清单），`missing_design_ids` 只列设计行真正缺失的 ID（缺口不
+计入），`first_diff_path` 按既有路径顺序定位到缺口条目的
+`/items/{index}/audit`——不会抛出 500。
+
 返回字段：
 
 | 字段 | 说明 |
 | --- | --- |
 | `archive_id` | 被校验的归档 ID |
 | `digest` | 归档时持久化的 SHA-256 摘要 |
-| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要；归档的 ID 列也损坏到无法解析时为 `null` |
-| `consistent` | 归档自身自洽、重算摘要与归档摘要一致**且无缺失设计项**时为 `true`；归档损坏、设计缺失或当前内容漂移均为 `false` |
-| `missing_design_ids` | 归档后已缺失（被删除或不存在）的设计 ID，升序；无缺失为 `[]` |
+| `recomputed_digest` | 按当前数据重算的 SHA-256 摘要；归档的 ID 列也损坏到无法解析，或设计行仍在而审计行缺失（审计缺口）时为 `null` |
+| `consistent` | 归档自身自洽、重算摘要与归档摘要一致**且无缺失设计项与审计缺口**时为 `true`；归档损坏、设计缺失、审计缺口或当前内容漂移均为 `false` |
+| `missing_design_ids` | 归档后已缺失（被删除或不存在）的设计 ID，升序；无缺失为 `[]`（设计行仍在、仅审计行缺失的审计缺口不计入） |
 | `first_diff_path` | 归档清单可解析且与**当前**清单存在内容差异时的**首个**差异路径（[JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) 风格，根为空串）；无法解析、归档自身字段不符或完全一致时为 `null` |
 
 差异定位顺序与规范化一致：对象按键名字典序、数组按下标升序；数组长度不同且
 公共前缀全等时指向第一个缺失下标（如设计被删除时为 `/design_count`），叶子
 值不同时一路深入（如 `/items/0/parameters/max_float`、
-`/items/0/audit/exceeds`）。归档不存在返回 404。
+`/items/0/audit/exceeds`）；审计行缺失（审计缺口）时指向
+`/items/{index}/audit`。归档不存在返回 404。
 
 ```bash
 curl -s http://localhost:8000/design-archives/1/verify

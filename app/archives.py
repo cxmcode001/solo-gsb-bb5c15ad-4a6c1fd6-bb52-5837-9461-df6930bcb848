@@ -183,23 +183,38 @@ def inspect_stored_archive(
     )
 
 
-def build_manifest(designs: list[dict]) -> dict:
+def build_manifest(
+    designs: list[dict], *, allow_audit_gaps: bool = False
+) -> dict:
     """按 ID 升序读取到的设计详情（db.get_designs_many 的返回）构建清单。
 
     调用方保证 designs 已按 ID 升序排列且全部存在。
+
+    设计行仍在而审计行缺失（**审计缺口**，详情的 ``audit`` 键为 None）时：
+
+    - ``allow_audit_gaps=False``（默认，POST 归档路径）：抛 KeyError——
+      数据不满足归档前提，宁可失败也绝不把缺口静默写进清单与摘要；
+    - ``allow_audit_gaps=True``（verify 重算路径）：缺口条目只含
+      ``design_id`` / ``parameters``、不含 ``audit`` 键，使这份部分清单
+      仍可与归档清单逐路径比较，首个差异即落在
+      ``/items/{index}/audit``。
     """
     design_ids = [d["id"] for d in designs]
     return {
         "format": MANIFEST_FORMAT,
         "design_ids": design_ids,
         "design_count": len(design_ids),
-        "items": [_build_item(d) for d in designs],
+        "items": [
+            _build_item(d, allow_audit_gaps=allow_audit_gaps) for d in designs
+        ],
     }
 
 
-def _build_item(design: dict) -> dict:
+def _build_item(design: dict, *, allow_audit_gaps: bool) -> dict:
     audit = design["audit"]
-    return {
+    if audit is None and not allow_audit_gaps:
+        raise KeyError(f"design {design['id']} is missing its audit row")
+    item: dict[str, Any] = {
         "design_id": design["id"],
         "parameters": {
             "name": design["name"],
@@ -213,12 +228,14 @@ def _build_item(design: dict) -> dict:
             "tie_up": design["tie_up"],
             "treadling": design["treadling"],
         },
-        "audit": {
+    }
+    if audit is not None:
+        item["audit"] = {
             "exceeds": audit["exceeds"],
             "interlacing": audit["interlacing"],
             "violations": audit["violations"],
-        },
-    }
+        }
+    return item
 
 
 def first_diff_path(stored: Any, current: Any) -> str | None:

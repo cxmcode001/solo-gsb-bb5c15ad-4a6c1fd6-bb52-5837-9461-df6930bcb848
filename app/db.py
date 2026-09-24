@@ -185,7 +185,7 @@ def insert_design_with_audit(
         return design_id
 
 
-def _row_to_detail(design: sqlite3.Row, audit: sqlite3.Row) -> dict:
+def _row_to_detail(design: sqlite3.Row, audit: sqlite3.Row | None) -> dict:
     return {
         "id": design["id"],
         "name": design["name"],
@@ -199,11 +199,16 @@ def _row_to_detail(design: sqlite3.Row, audit: sqlite3.Row) -> dict:
         "tie_up": json.loads(design["tie_up"]),
         "treadling": json.loads(design["treadling"]),
         "created_at": design["created_at"],
-        "audit": {
-            "exceeds": bool(audit["exceeds"]),
-            "interlacing": json.loads(audit["interlacing"]),
-            "violations": json.loads(audit["violations"]),
-        },
+        # 审计行缺失（审计缺口）时为 None，由调用方按缺口处理
+        "audit": (
+            {
+                "exceeds": bool(audit["exceeds"]),
+                "interlacing": json.loads(audit["interlacing"]),
+                "violations": json.loads(audit["violations"]),
+            }
+            if audit is not None
+            else None
+        ),
     }
 
 
@@ -355,6 +360,12 @@ def get_designs_many(design_ids: list[int]) -> list[dict | None]:
     的也是某一时刻的自洽整体，绝不会把新旧版本拼成从未存在过的清单。
     POST /design-archives 的归档创建与 GET .../verify 的校验都经此函数，
     共用同一快照语义。
+
+    正常路径下设计存在则其审计行必然存在（同事务写入、UNIQUE 外键约束）；
+    若审计行在入库后被绕过 API 直接删除（**审计缺口**：设计行仍在、audits
+    行缺失），对应详情的 ``audit`` 键为 None——缺口在同一快照内如实上报，
+    由调用方判定如何处理（verify 据此报 inconsistent 而非 500），本函数
+    不抛 KeyError。
     """
     if not design_ids:
         return []
@@ -376,10 +387,10 @@ def get_designs_many(design_ids: list[int]) -> list[dict | None]:
             if design is None:
                 results.append(None)
                 continue
-            # 设计与审计在同一快照内读出：设计存在则其审计行必然存在
-            # （同事务写入、UNIQUE 外键约束）。
+            # 设计行与审计行在同一快照内读出；审计行缺失时 _row_to_detail
+            # 返回 audit=None 的详情（审计缺口），调用方据此上报不一致。
             results.append(
-                _row_to_detail(design, audits_by_design[design_id])
+                _row_to_detail(design, audits_by_design.get(design_id))
             )
         return results
 

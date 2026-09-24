@@ -687,14 +687,17 @@ def verify_design_archive(archive_id: int) -> dict:
     `consistent=false`。
 
     - `consistent`：归档自身自洽、重算摘要与归档摘要一致且无缺失设计项时
-      为 `true`；归档自身损坏、设计缺失或当前内容漂移均为 `false`；
+      为 `true`；归档自身损坏、设计缺失、审计缺口（设计行仍在、audits 行
+      被删）或当前内容漂移均为 `false`；
     - `recomputed_digest`：按当前数据重建清单重算的摘要；design_ids 列也
-      损坏到无法解析时为 `null`；
+      损坏到无法解析，或存在审计缺口（无法重建完整清单）时为 `null`；
     - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；
+      设计行仍在、仅审计行缺失的审计缺口不计入；
     - `first_diff_path`：归档清单结构有效且与当前清单存在内容差异时给出
       首个差异路径（JSON Pointer 风格，如
-      `/items/0/audit/exceeds`、`/design_count`）；manifest 无法解析、
-      归档自身字段不符或完全一致时为 `null`。
+      `/items/0/audit/exceeds`、`/design_count`；审计缺口对应
+      `/items/{index}/audit`）；manifest 无法解析、归档自身字段不符或
+      完全一致时为 `null`。
 
     接口只读计算，不修改归档与设计。
     """
@@ -727,8 +730,18 @@ def verify_design_archive(archive_id: int) -> dict:
             if item is None
         ]
         present = [item for item in current_rows if item is not None]
-        current_manifest = archives.build_manifest(present)
-        recomputed = archives.digest_of(current_manifest)
+        # 审计缺口（设计行仍在、audits 行在归档后被删）：参数仍可读出但
+        # 审计无从恢复，当前数据不足以重建完整清单——recomputed_digest 置
+        # null 并据此判 inconsistent。仍构建「缺口条目不含 audit 键」的
+        # 部分清单，供与归档清单逐路径比较（首个差异落在
+        # /items/{index}/audit）。缺失设计的判定只看设计行，缺口不计入
+        # missing_design_ids。
+        audit_gaps = any(item["audit"] is None for item in present)
+        current_manifest = archives.build_manifest(
+            present, allow_audit_gaps=True
+        )
+        if not audit_gaps:
+            recomputed = archives.digest_of(current_manifest)
 
     # 归档自身损坏（含 manifest 非法 JSON、非规范化、digest/列值不符等）
     # 一律不一致；manifest 无法解析或列值对不上导致无法重算时没有可逐路径

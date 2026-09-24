@@ -323,6 +323,97 @@ def test_verify_detects_deleted_design():
               "verify is read-only: stored digest untouched")
 
 
+def test_verify_detects_deleted_audit_row():
+    """归档后 audits 行被删（设计行保留）时不得 500：在同一读取快照中识别
+    审计缺口，返回 200、consistent=false、recomputed_digest=null，
+    first_diff_path 定位到 /items/{index}/audit；missing_design_ids 只列
+    真正缺失的设计。修复前 db.get_designs_many 对缺失审计行抛 KeyError，
+    verify 返回 500。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        # API 不开放删除审计：直接在 SQLite 中删除 audits 行（设计行保留），
+        # 模拟归档后审计缺口。
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("DELETE FROM audits WHERE design_id = ?", (a["id"],))
+
+        snapshot = _archive_row_raw(created["id"])
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200,
+              f"audit gap returns 200, not 500 (got {resp.status_code})")
+        report = resp.json()
+        check(report["consistent"] is False, "audit gap breaks consistency")
+        check(report["missing_design_ids"] == [],
+              "design row still present -> not reported missing")
+        check(report["recomputed_digest"] is None,
+              "recomputed digest null when an audit row is missing")
+        check(report["digest"] == created["digest"], "stored digest echoed")
+        check(report["first_diff_path"] == "/items/0/audit",
+              f"first diff points at the missing audit, "
+              f"got {report['first_diff_path']!r}")
+
+        # 校验只读且结果稳定
+        again = client.get(f"/design-archives/{created['id']}/verify").json()
+        check(again == report, "verify stays stable on repeat (pure read)")
+        check(_archive_row_raw(created["id"]) == snapshot,
+              "verify is read-only against an audit-gapped archive")
+
+        # 缺口设计不能被静默归档：POST 宁可失败也不得把缺审计的清单写库
+        rows_before = _archive_rows()
+        with TestClient(app, raise_server_exceptions=False) as raw:
+            post_resp = raw.post("/design-archives",
+                                 json={"design_ids": [a["id"]]})
+        check(post_resp.status_code >= 500,
+              "archiving an audit-gapped design fails loudly "
+              f"(got {post_resp.status_code})")
+        check(_archive_rows() == rows_before,
+              "failed archive of audit-gapped design writes no row")
+
+
+def test_verify_audit_gap_path_and_missing_combination():
+    """多设计归档中的审计缺口：first_diff_path 按既有路径顺序定位到缺口条目
+    的 /items/{index}/audit；缺口与设计缺失同时存在时 missing_design_ids
+    只列真正缺失的设计，首个差异仍按既有顺序（design_count 2->1 先于 items）。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        b = _create(client, PLAIN)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"], b["id"]]}
+        ).json()
+
+        # 仅 b 的审计行缺失：缺口定位到第二个条目
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("DELETE FROM audits WHERE design_id = ?", (b["id"],))
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200, "audit gap in second item returns 200")
+        report = resp.json()
+        check(report["consistent"] is False, "audit gap breaks consistency")
+        check(report["missing_design_ids"] == [],
+              "both design rows present -> no missing designs")
+        check(report["recomputed_digest"] is None,
+              "recomputed digest null while any audit row is missing")
+        check(report["first_diff_path"] == "/items/1/audit",
+              f"first diff points at the gapped item's audit, "
+              f"got {report['first_diff_path']!r}")
+
+        # 再删掉 a 的设计行（审计级联删除）：缺口与缺失并存
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM designs WHERE id = ?", (a["id"],))
+        report = client.get(f"/design-archives/{created['id']}/verify").json()
+        check(report["consistent"] is False, "combined damage inconsistent")
+        check(report["missing_design_ids"] == [a["id"]],
+              "only the truly deleted design is reported missing")
+        check(report["recomputed_digest"] is None,
+              "recomputed digest stays null while an audit gap remains")
+        check(report["first_diff_path"] == "/design_count",
+              f"first diff follows existing path order, "
+              f"got {report['first_diff_path']!r}")
+
+
 def test_verify_detects_drift_first_diff_path():
     with TestClient(app) as client:
         a = _create(client, TWILL)
@@ -682,6 +773,8 @@ if __name__ == "__main__":
     test_pydantic_validation_422()
     test_verify_fresh_archive_consistent()
     test_verify_detects_deleted_design()
+    test_verify_detects_deleted_audit_row()
+    test_verify_audit_gap_path_and_missing_combination()
     test_verify_detects_drift_first_diff_path()
     test_verify_detects_corrupted_manifest_json()
     test_verify_detects_rewritten_manifest_without_design_change()
