@@ -646,8 +646,12 @@ def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
             detail="design_ids must not contain duplicates",
         )
     stored = db.get_designs_many(design_ids)
+    # 设计行缺失（None）或审计行缺失（DesignAuditGap）都无法生成完整清单，
+    # 按「设计未就绪」拒绝归档（404，不写库）。
     missing = [
-        design_id for design_id, item in zip(design_ids, stored) if item is None
+        design_id
+        for design_id, item in zip(design_ids, stored)
+        if item is None or isinstance(item, db.DesignAuditGap)
     ]
     if missing:
         raise HTTPException(
@@ -686,15 +690,22 @@ def verify_design_archive(archive_id: int) -> dict:
     （如 manifest 被改写、列与清单不符、digest 不匹配）都直接判
     `consistent=false`。
 
-    - `consistent`：归档自身自洽、重算摘要与归档摘要一致且无缺失设计项时
-      为 `true`；归档自身损坏、设计缺失或当前内容漂移均为 `false`；
+    当前快照重算时区分两类缺口：**设计行整体缺失**（被删除或从未存在）与
+    **审计缺口**（设计行仍在、audits 行被绕过外键的外部操作删除）。二者都
+    在同一个 SQLite 读取快照内识别，接口始终返回 200 而不会 500。
+
+    - `consistent`：归档自身自洽、重算摘要与归档摘要一致、无缺失设计项且
+      无审计缺口时为 `true`；归档自身损坏、设计 / 审计缺失或当前内容漂移
+      均为 `false`；
     - `recomputed_digest`：按当前数据重建清单重算的摘要；design_ids 列也
-      损坏到无法解析时为 `null`；
-    - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；
+      损坏到无法解析，或快照中存在审计缺口（清单无法完整重建）时为 `null`；
+    - `missing_design_ids`：设计行整体缺失的 ID（升序）；**审计缺口不计入**
+      ——设计行仍在，不属于「缺失的设计」；
     - `first_diff_path`：归档清单结构有效且与当前清单存在内容差异时给出
       首个差异路径（JSON Pointer 风格，如
-      `/items/0/audit/exceeds`、`/design_count`）；manifest 无法解析、
-      归档自身字段不符或完全一致时为 `null`。
+      `/items/0/audit/exceeds`、`/design_count`）；审计缺口按既有路径顺序
+      定位到 `/items/{index}/audit`（index 为该设计在归档 items 中的位置）；
+      manifest 无法解析、归档自身字段不符或完全一致时为 `null`。
 
     接口只读计算，不修改归档与设计。
     """
@@ -718,6 +729,7 @@ def verify_design_archive(archive_id: int) -> dict:
 
     recomputed: str | None = None
     missing: list[int] = []
+    audit_gaps = False
     current_manifest: dict | None = None
     if design_ids is not None:
         current_rows = db.get_designs_many(design_ids)
@@ -726,9 +738,16 @@ def verify_design_archive(archive_id: int) -> dict:
             for design_id, item in zip(design_ids, current_rows)
             if item is None
         ]
+        # 保留审计缺口项（DesignAuditGap）：设计行仍在，item 以 audit=None
+        # 占位参与清单重建，使差异能按路径顺序定位到 /items/{i}/audit。
         present = [item for item in current_rows if item is not None]
+        audit_gaps = any(
+            isinstance(item, db.DesignAuditGap) for item in present
+        )
         current_manifest = archives.build_manifest(present)
-        recomputed = archives.digest_of(current_manifest)
+        # 存在审计缺口时清单无法完整重建，不重算摘要（recomputed=null）。
+        if not audit_gaps:
+            recomputed = archives.digest_of(current_manifest)
 
     # 归档自身损坏（含 manifest 非法 JSON、非规范化、digest/列值不符等）
     # 一律不一致；manifest 无法解析或列值对不上导致无法重算时没有可逐路径
@@ -741,6 +760,7 @@ def verify_design_archive(archive_id: int) -> dict:
         )
     consistent = (
         check.self_consistent
+        and not audit_gaps
         and recomputed == record["digest"]
         and not missing
         and first_diff is None

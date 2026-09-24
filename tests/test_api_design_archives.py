@@ -323,6 +323,176 @@ def test_verify_detects_deleted_design():
               "verify is read-only: stored digest untouched")
 
 
+def _delete_audit(design_id):
+    """直接删除 audits 行而保留 designs 行（模拟绕过应用事务的外部维护进程
+    删掉审计，留下审计缺口；删除审计行本身不受外键方向限制）。"""
+    with sqlite3.connect(_TMP_DB.name) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM audits WHERE design_id = ?", (design_id,))
+
+
+def test_verify_detects_missing_audit_row():
+    """设计行仍在、audits 行被删（审计缺口）时不得抛 KeyError 变 500：
+    返回 200、consistent=false、missing_design_ids 不含该 ID（设计并未缺
+    失）、recomputed_digest=null（清单无法完整重建）、差异按既有路径顺序
+    定位到 /items/0/audit。修复前 db 层 audits_by_design[id] 直接 KeyError。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"]]}
+        ).json()
+
+        _delete_audit(a["id"])
+        resp = client.get(f"/design-archives/{created['id']}/verify")
+        check(resp.status_code == 200,
+              f"missing audit row returns 200, not 500 (got {resp.status_code})")
+        report = resp.json()
+        check(report["consistent"] is False, "audit gap breaks consistency")
+        check(report["missing_design_ids"] == [],
+              "design row still present: not listed as missing")
+        check(report["recomputed_digest"] is None,
+              "recomputed_digest is null while the manifest cannot be rebuilt fully")
+        check(report["digest"] == created["digest"], "stored digest still echoed")
+        check(report["first_diff_path"] == "/items/0/audit",
+              f"diff located at the item's audit node, "
+              f"got {report['first_diff_path']!r}")
+
+        # 校验只读且结果稳定
+        stored = db.get_archive(created["id"])
+        check(stored is not None and stored["digest"] == created["digest"],
+              "verify is read-only against an audit-gap state")
+        again = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(again == report, "verify is a pure read: repeated report identical")
+
+
+def test_verify_audit_gap_index_and_mixed_missing():
+    """多 item 归档：审计缺口路径按下标定位到 /items/{index}/audit；与设计
+    整体缺失同时存在时 design_count 先出现，missing_design_ids 只列真正缺
+    失的设计 ID。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)
+        b = _create(client, PLAIN)
+        created = client.post(
+            "/design-archives", json={"design_ids": [a["id"], b["id"]]}
+        ).json()
+
+        # 只删第二个设计的审计：差异深入 items/1/audit
+        _delete_audit(b["id"])
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False, "audit gap on second item inconsistent")
+        check(report["missing_design_ids"] == [],
+              "audit gap is not a missing design id")
+        check(report["recomputed_digest"] is None,
+              "any audit gap -> recomputed_digest null")
+        check(report["first_diff_path"] == "/items/1/audit",
+              f"gap located by item index, got {report['first_diff_path']!r}")
+
+        # 再整体删除第一个设计：missing 只列 a；规范键序 design_count 先于 items
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM designs WHERE id = ?", (a["id"],))
+        report = client.get(
+            f"/design-archives/{created['id']}/verify"
+        ).json()
+        check(report["consistent"] is False, "gap plus deletion inconsistent")
+        check(report["missing_design_ids"] == [a["id"]],
+              "missing list names only the fully deleted design")
+        check(report["recomputed_digest"] is None,
+              "recomputed_digest stays null with an audit gap present")
+        check(report["first_diff_path"] == "/design_count",
+              f"count diff precedes item diffs, got {report['first_diff_path']!r}")
+
+
+def test_post_archive_rejects_missing_audit_row():
+    """审计缺口状态下新建归档必须 404 且不写库（无法生成完整清单），不能因
+    KeyError 变 500。"""
+    with TestClient(app) as client:
+        a = _create(client, TWILL)["id"]
+        b = _create(client, PLAIN)["id"]
+        rows_before = _archive_rows()
+
+        _delete_audit(a)
+        resp = client.post(
+            "/design-archives", json={"design_ids": [a, b]}
+        )
+        check(resp.status_code == 404,
+              f"audit gap rejected with 404, got {resp.status_code}")
+        check(str(a) in resp.json()["detail"], "404 detail lists the gap design id")
+        check(_archive_rows() == rows_before,
+              "rejected request with audit gap writes no archive row")
+
+
+def test_audit_gap_detection_pinned_to_single_sqlite_snapshot():
+    """并发回归：另一连接在批量读取的 designs 查询之后、audits 查询之前删除
+    某审计行时，POST 归档的读取固定在删除前快照（审计仍在，正常 201）；删除
+    落盘后 verify 在自己的单一快照内识别审计缺口（200、consistent=false、
+    /items/0/audit），不会把「新设计行 + 旧判定」拼成 KeyError 或假结果。"""
+    with sqlite3.connect(_TMP_DB.name) as conn:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    check(mode.lower() == "wal", "test database switched to WAL for the race window")
+
+    try:
+        with TestClient(app) as client:
+            a = _create(client, TWILL)
+            fired = {"count": 0}
+            real_connect = sqlite3.connect
+
+            def maintenance_commit():
+                writer = sqlite3.connect(_TMP_DB.name, timeout=10)
+                writer.execute("DELETE FROM audits WHERE design_id = ?", (a["id"],))
+                writer.commit()
+                writer.close()
+                fired["count"] += 1
+
+            def patched_connect(path, *args, **kwargs):
+                conn = real_connect(path, *args, **kwargs)
+                if str(path) == _TMP_DB.name and fired["count"] == 0:
+                    def trace(sql):
+                        # 只在批量读取的审计 SELECT 即将执行时触发；维护连接
+                        # 自身的 DELETE FROM audits 也含 " FROM audits"，需排除。
+                        if (
+                            fired["count"] == 0
+                            and " FROM audits" in sql
+                            and sql.lstrip().upper().startswith("SELECT")
+                        ):
+                            maintenance_commit()
+                    conn.set_trace_callback(trace)
+                return conn
+
+            sqlite3.connect = patched_connect
+            try:
+                resp = client.post(
+                    "/design-archives", json={"design_ids": [a["id"]]}
+                )
+            finally:
+                sqlite3.connect = real_connect
+
+            check(fired["count"] == 1, "external writer deleted audit mid-read")
+            check(resp.status_code == 201,
+                  f"pre-delete snapshot still has the audit -> 201, "
+                  f"got {resp.status_code} {resp.text}")
+            archive_id = resp.json()["id"]
+
+            report = client.get(
+                f"/design-archives/{archive_id}/verify"
+            ).json()
+            check(report["consistent"] is False,
+                  "verify snapshot identifies the committed audit gap")
+            check(report["missing_design_ids"] == [],
+                  "design row still exists in the verify snapshot")
+            check(report["recomputed_digest"] is None,
+                  "audit gap -> recomputed_digest null")
+            check(report["first_diff_path"] == "/items/0/audit",
+                  f"gap diff at /items/0/audit, got {report['first_diff_path']!r}")
+    finally:
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("PRAGMA journal_mode=DELETE")
+
+
 def test_verify_detects_drift_first_diff_path():
     with TestClient(app) as client:
         a = _create(client, TWILL)
@@ -682,6 +852,10 @@ if __name__ == "__main__":
     test_pydantic_validation_422()
     test_verify_fresh_archive_consistent()
     test_verify_detects_deleted_design()
+    test_verify_detects_missing_audit_row()
+    test_verify_audit_gap_index_and_mixed_missing()
+    test_post_archive_rejects_missing_audit_row()
+    test_audit_gap_detection_pinned_to_single_sqlite_snapshot()
     test_verify_detects_drift_first_diff_path()
     test_verify_detects_corrupted_manifest_json()
     test_verify_detects_rewritten_manifest_without_design_change()

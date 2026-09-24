@@ -186,7 +186,11 @@ def inspect_stored_archive(
 def build_manifest(designs: list[dict]) -> dict:
     """按 ID 升序读取到的设计详情（db.get_designs_many 的返回）构建清单。
 
-    调用方保证 designs 已按 ID 升序排列且全部存在。
+    调用方保证 designs 已按 ID 升序排列，且不含「设计行整体缺失」的 None
+    项；但允许包含设计在、审计缺的缺口项（``design["audit"] is None``，
+    见 db.DesignAuditGap）——缺口项的 parameters 照常生成，audit 以 None
+    占位，使缺口与归档清单的差异能被 first_diff_path 按既有路径顺序定位
+    到 ``/items/{index}/audit``。
     """
     design_ids = [d["id"] for d in designs]
     return {
@@ -213,7 +217,11 @@ def _build_item(design: dict) -> dict:
             "tie_up": design["tie_up"],
             "treadling": design["treadling"],
         },
-        "audit": {
+        # 审计缺口（设计行存在、审计行被外部删除）：None 占位，不重算摘要，
+        # 差异由 first_diff_path 定位到本 item 的 /audit。
+        "audit": None
+        if audit is None
+        else {
             "exceeds": audit["exceeds"],
             "interlacing": audit["interlacing"],
             "violations": audit["violations"],

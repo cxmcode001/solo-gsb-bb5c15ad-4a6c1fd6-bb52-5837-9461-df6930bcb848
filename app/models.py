@@ -547,20 +547,24 @@ class DesignArchiveVerifyOut(BaseModel):
     recomputed_digest: str | None = Field(
         ...,
         description="按归档 ID 列表重新读取当前设计参数与审计结果后重算的摘要；"
-        "归档记录的 design_ids 列也损坏到无法解析时为 null",
+        "归档记录的 design_ids 列损坏到无法解析，或当前快照存在审计缺口"
+        "（设计行仍在、audits 行缺失）导致清单无法完整重建时为 null",
     )
     consistent: bool = Field(
         ...,
         description="归档自身自洽（manifest 为规范化 JSON、SHA-256 等于 digest、"
-        "清单内 ID/数量与列值一致）、重算摘要一致且无缺失设计项时为 true"
+        "清单内 ID/数量与列值一致）、重算摘要一致、无缺失设计项且无审计缺口时"
+        "为 true"
     )
     missing_design_ids: list[int] = Field(
         ...,
-        description="归档 ID 列表中当前已缺失（删除或不存在）的设计 ID，升序",
+        description="归档 ID 列表中设计行当前已缺失（删除或不存在）的设计 ID，"
+        "升序；设计行仍在而审计行缺失的审计缺口不计入此列表",
     )
     first_diff_path: str | None = Field(
         ...,
         description="归档清单结构有效且与当前清单存在内容差异时的首个差异路径"
-        "（JSON Pointer 风格，根为空串）；manifest 无法解析、归档自身字段不符"
-        "或内容完全一致时为 null",
+        "（JSON Pointer 风格，根为空串）；审计缺口（设计在、审计缺）定位到"
+        "/items/{index}/audit；manifest 无法解析、归档自身字段不符或内容完全"
+        "一致时为 null",
     )

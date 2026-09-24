@@ -71,6 +71,17 @@ class DuplicateTagError(ValueError):
 class ArchiveNotFoundError(LookupError):
     """查询 / 校验归档时归档 ID 不存在。"""
 
+
+class DesignAuditGap(dict):
+    """设计行仍在、但审计行缺失的「审计缺口」标记（结构与设计详情字典相同，
+    仅 ``audit`` 为 None）。
+
+    正常入库路径下设计与审计同事务写入、且 audits.design_id 有 UNIQUE 外键
+    约束，二者必然同时存在；但外部进程可绕过应用事务（如关闭 foreign_keys
+    后直接 DELETE audits）留下孤儿设计行。批量读取在同一快照内识别此情况并
+    返回该标记，而不是让缺失键直接抛 KeyError 升级成 500。
+    """
+
 _lock = threading.Lock()
 
 
@@ -205,6 +216,28 @@ def _row_to_detail(design: sqlite3.Row, audit: sqlite3.Row) -> dict:
             "violations": json.loads(audit["violations"]),
         },
     }
+
+
+def _row_to_design_only(design: sqlite3.Row) -> DesignAuditGap:
+    """设计行存在而审计行缺失时的降级结果：字段与 _row_to_detail 相同，
+    仅 audit 为 None（DesignAuditGap 标记，供归档校验识别审计缺口）。"""
+    return DesignAuditGap(
+        {
+            "id": design["id"],
+            "name": design["name"],
+            "cyclic": bool(design["cyclic"]),
+            "max_float": design["max_float"],
+            "shafts": design["shafts"],
+            "treadles": design["treadles"],
+            "warp_ends": design["warp_ends"],
+            "weft_picks": design["weft_picks"],
+            "threading": json.loads(design["threading"]),
+            "tie_up": json.loads(design["tie_up"]),
+            "treadling": json.loads(design["treadling"]),
+            "created_at": design["created_at"],
+            "audit": None,
+        }
+    )
 
 
 def get_design(design_id: int) -> dict | None:
@@ -345,16 +378,21 @@ def list_design_tags(design_id: int) -> dict:
         }
 
 
-def get_designs_many(design_ids: list[int]) -> list[dict | None]:
-    """按给定顺序返回设计详情（结构与 get_design 一致）；缺失的 ID 对应
-    位置为 None。
+def get_designs_many(
+    design_ids: list[int],
+) -> list[dict | None]:
+    """按给定顺序返回设计详情（结构与 get_design 一致）；设计行缺失的 ID
+    对应位置为 None；设计行存在但审计行缺失（审计缺口）时对应位置为
+    ``DesignAuditGap``（详情结构、``audit=None``）。
 
-    所有设计行、各自审计行与「ID 是否缺失」的判定都在**同一个 SQLite 读取
-    快照**（一个显式只读事务，见 `_read_snapshot`）内完成：即便另一服务
-    实例或维护进程在批量读取期间提交了设计 / 审计修改或删除，本次调用返回
-    的也是某一时刻的自洽整体，绝不会把新旧版本拼成从未存在过的清单。
-    POST /design-archives 的归档创建与 GET .../verify 的校验都经此函数，
-    共用同一快照语义。
+    所有设计行、各自审计行与「ID 是否缺失 / 审计是否缺口」的判定都在
+    **同一个 SQLite 读取快照**（一个显式只读事务，见 `_read_snapshot`）内
+    完成：即便另一服务实例或维护进程在批量读取期间提交了设计 / 审计修改或
+    删除，本次调用返回的也是某一时刻的自洽整体，绝不会把新旧版本拼成从未
+    存在过的清单。正常入库路径下设计与审计同事务写入且有 UNIQUE 外键约束，
+    二者必然同时存在；审计缺口只会由绕过应用事务的外部删除造成，此时返回
+    缺口标记而非直接 KeyError。POST /design-archives 的归档创建与
+    GET .../verify 的校验都经此函数，共用同一快照语义。
     """
     if not design_ids:
         return []
@@ -376,11 +414,13 @@ def get_designs_many(design_ids: list[int]) -> list[dict | None]:
             if design is None:
                 results.append(None)
                 continue
-            # 设计与审计在同一快照内读出：设计存在则其审计行必然存在
-            # （同事务写入、UNIQUE 外键约束）。
-            results.append(
-                _row_to_detail(design, audits_by_design[design_id])
-            )
+            audit = audits_by_design.get(design_id)
+            if audit is None:
+                # 设计在、审计缺：同一快照内识别出的审计缺口（外部进程绕过
+                # 外键约束删除审计行所致），返回缺口标记而不是抛 KeyError。
+                results.append(_row_to_design_only(design))
+            else:
+                results.append(_row_to_detail(design, audit))
         return results
 
 
